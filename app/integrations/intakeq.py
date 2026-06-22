@@ -6,42 +6,40 @@ from app.config import settings
 
 
 class IntakeQClient:
-    """IntakeQ API client."""
+    """IntakeQ API client (async)."""
 
     def __init__(self):
         self.base_url = settings.intakeq_api_url
         self.api_key = settings.intakeq_api_key
         self._client = None
 
-    @property
-    def client(self) -> httpx.Client:
+    async def client(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = httpx.Client(
+            self._client = httpx.AsyncClient(
                 base_url=self.base_url,
                 headers={"X-Auth-Token": self.api_key, "Accept": "application/json"},
                 timeout=30.0,
             )
         return self._client
 
-    def get_clients(self, search: str | None = None) -> list[dict]:
-        """
-        Get clients.
-        search: email, phone, or name
-        """
+    async def get_clients(self, search: str | None = None) -> list[dict]:
+        """Get clients. search: email, phone, or name."""
         params = {}
         if search:
             params["search"] = search
-        r = self.client.get("/clients", params=params)
+        client = await self.client()
+        r = await client.get("/clients", params=params)
         r.raise_for_status()
         return r.json()
 
-    def get_client(self, client_id: int) -> dict:
+    async def get_client(self, client_id: int) -> dict:
         """Get single client by ID."""
-        r = self.client.get(f"/clients/{client_id}")
+        client = await self.client()
+        r = await client.get(f"/clients/{client_id}")
         r.raise_for_status()
         return r.json()
 
-    def get_appointments(
+    async def get_appointments(
         self, start_date: date | None = None, end_date: date | None = None
     ) -> list[dict]:
         """Get appointments with date range filter."""
@@ -50,38 +48,44 @@ class IntakeQClient:
             params["startDate"] = start_date.isoformat()
         if end_date:
             params["endDate"] = end_date.isoformat()
-        r = self.client.get("/appointments", params=params)
+        client = await self.client()
+        r = await client.get("/appointments", params=params)
         r.raise_for_status()
         return r.json()
 
-    def get_appointment(self, appointment_id: int) -> dict:
+    async def get_appointment(self, appointment_id: int) -> dict:
         """Get single appointment by ID."""
-        r = self.client.get(f"/appointments/{appointment_id}")
+        client = await self.client()
+        r = await client.get(f"/appointments/{appointment_id}")
         r.raise_for_status()
         return r.json()
 
-    def create_appointment(self, data: dict) -> dict:
+    async def create_appointment(self, data: dict) -> dict:
         """Create new appointment in IntakeQ (for billing sync)."""
-        r = self.client.post("/appointments", json=data)
+        client = await self.client()
+        r = await client.post("/appointments", json=data)
         r.raise_for_status()
         return r.json()
 
-    def update_appointment(self, appointment_id: int, data: dict) -> dict:
+    async def update_appointment(self, appointment_id: int, data: dict) -> dict:
         """Update existing appointment."""
-        r = self.client.put(f"/appointments/{appointment_id}", json=data)
+        client = await self.client()
+        r = await client.put(f"/appointments/{appointment_id}", json=data)
         r.raise_for_status()
         return r.json()
 
-    def get_questionnaires(self, client_id: int) -> list[dict]:
+    async def get_questionnaires(self, client_id: int) -> list[dict]:
         """Get questionnaires for a client."""
-        r = self.client.get(f"/clients/{client_id}/intakes")
+        client = await self.client()
+        r = await client.get(f"/clients/{client_id}/intakes")
         r.raise_for_status()
         return r.json()
 
-    def close(self):
+    async def close(self):
         """Close the HTTP client."""
         if self._client:
-            self._client.close()
+            await self._client.aclose()
+            self._client = None
 
 
 # Singleton instance

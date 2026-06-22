@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from datetime import datetime, date
@@ -10,20 +11,28 @@ from app.db.models import CallLog, ReviewItem, Client
 from app.integrations.acuity import acuity
 from app.integrations.intakeq import intakeq
 from app.integrations.vapi import VapiFunctionCall, FUNCTION_DESCRIPTIONS, SYSTEM_PROMPT
+from app.services.state import call_state
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="The Practice Voice Agent")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage startup/shutdown."""
+    await call_state.init()
+    yield
+    await acuity.close()
+    await intakeq.close()
+    await call_state.close()
+
+
+app = FastAPI(title="The Practice Voice Agent", lifespan=lifespan)
 
 
 @app.get("/")
 def health():
     return {"status": "healthy", "service": "thepractice-voice-agent"}
-
-
-# Store call state in-memory (Redis in production)
-_call_state = {}
 
 
 @app.post("/webhooks/vapi")
@@ -35,7 +44,6 @@ async def vapi_webhook(request: Request, background_tasks: BackgroundTasks):
     call_id = payload.get("call", {}).get("id")
 
     if event_type == "assistant-request":
-        # Initial request - return config
         return {
             "response": {
                 "assistant": {
@@ -47,12 +55,10 @@ async def vapi_webhook(request: Request, background_tasks: BackgroundTasks):
         }
 
     elif event_type == "function-call":
-        # Execute function call
         func_call = VapiFunctionCall(**payload.get("functionCall", {}))
         return await handle_function_call(func_call, call_id, background_tasks)
 
     elif event_type == "conversation-update":
-        # Log call completion
         background_tasks.add_task(log_call_completed, payload)
         return {"status": "logged"}
 
@@ -96,30 +102,26 @@ async def check_availability(args: dict) -> dict:
     appt_type = args.get("appointment_type")
     date_str = args.get("date")
 
-    # Parse date
     try:
         appt_date = date.fromisoformat(date_str.replace("-", ""))
     except ValueError:
         return {"error": "Invalid date format. Use YYYY-MM-DD."}
 
-    # Get calendars and appointment types
-    calendars = acuity.get_calendars()
-    appt_types = acuity.get_appointment_types()
+    # Get calendars and appointment types (cached)
+    calendars = await acuity.get_calendars()
+    appt_types = await acuity.get_appointment_types()
 
     # Find matching calendar
-    calendar = next((c for c in calendars if provider_name.lower() in c.get("name", "").lower()), None)
+    calendar = acuity.find_calendar(calendars, provider_name)
     if not calendar:
         return {"error": f"Provider '{provider_name}' not found."}
 
     # Find matching appointment type
-    appt_type_obj = next(
-        (t for t in appt_types if appt_type.lower() in t.get("name", "").lower()), None
-    )
+    appt_type_obj = acuity.find_appointment_type(appt_types, appt_type)
     if not appt_type_obj:
         return {"error": f"Appointment type '{appt_type}' not found."}
 
-    # Check availability
-    slots = acuity.check_availability(
+    slots = await acuity.check_availability(
         appointment_type_id=appt_type_obj["id"],
         calendar_id=calendar["id"],
         date=appt_date,
@@ -131,7 +133,6 @@ async def check_availability(args: dict) -> dict:
             "message": f"No available slots for {provider_name} on {date_str}. Would you like to check another date?"
         }
 
-    # Return first few available slots
     available_times = [slot.get("time") for slot in slots[:5]]
     return {
         "available": True,
@@ -152,28 +153,25 @@ async def book_appointment(args: dict, call_id: str, background_tasks: Backgroun
     time_str = args.get("time")
     is_new = args.get("is_new_patient", True)
 
-    # Validate required fields
     if not all([email, name, provider_name, appt_type, date_str, time_str]):
         return {"error": "Missing required fields."}
 
-    # Get calendar and appointment type IDs
-    calendars = acuity.get_calendars()
-    appt_types = acuity.get_appointment_types()
+    calendars = await acuity.get_calendars()
+    appt_types = await acuity.get_appointment_types()
 
-    calendar = next((c for c in calendars if provider_name.lower() in c.get("name", "").lower()), None)
-    appt_type_obj = next(
-        (t for t in appt_types if appt_type.lower() in t.get("name", "").lower()), None
-    )
+    calendar = acuity.find_calendar(calendars, provider_name)
+    appt_type_obj = acuity.find_appointment_type(appt_types, appt_type)
 
     if not calendar:
         return {"error": f"Provider '{provider_name}' not found."}
     if not appt_type_obj:
         return {"error": f"Appointment type '{appt_type}' not found."}
 
-    # Build appointment data
+    # Don't split names - let Acuity handle it
     appt_data = {
-        "firstName": name.split()[0] if name else "",
-        "lastName": " ".join(name.split()[1:]) if len((name or "").split()) > 1 else "",
+        "firstName": "",
+        "lastName": "",
+        "name": name,  # Send full name
         "email": email,
         "phone": phone,
         "appointmentTypeID": appt_type_obj["id"],
@@ -182,15 +180,11 @@ async def book_appointment(args: dict, call_id: str, background_tasks: Backgroun
         "time": time_str,
     }
 
-    # Book in Acuity
-    result = acuity.book_appointment(appt_data)
+    result = await acuity.book_appointment(appt_data)
 
-    # Store call state for summary
-    _call_state[call_id] = _call_state.get(call_id, {})
-    _call_state[call_id]["outcome"] = "booked"
-    _call_state[call_id]["appointment_id"] = result.get("id")
+    await call_state.set(call_id, "outcome", "booked")
+    await call_state.set(call_id, "appointment_id", result.get("id"))
 
-    # Log to database in background
     background_tasks.add_task(
         log_booking,
         call_id=call_id,
@@ -229,6 +223,7 @@ async def lookup_client(args: dict) -> dict:
         local_client = None
 
     if local_client:
+        db.close()
         return {
             "found": True,
             "client_id": local_client.id,
@@ -237,18 +232,32 @@ async def lookup_client(args: dict) -> dict:
         }
 
     # Check Acuity
-    acuity_clients = acuity.get_clients(email=email, phone=phone)
+    acuity_clients = await acuity.get_clients(email=email, phone=phone)
     if acuity_clients:
         client = acuity_clients[0]
-        # Store in local DB
+        acuity_id = client.get("id")
+
+        # Check if we already have this acuity_id to prevent dupes
+        existing = db.query(Client).filter(Client.acuity_id == acuity_id).first()
+        if existing:
+            db.close()
+            return {
+                "found": True,
+                "client_id": existing.id,
+                "name": existing.name,
+                "is_returning": True,
+            }
+
+        # New to us but exists in Acuity
         new_client = Client(
             email=client.get("email"),
             phone=client.get("phone"),
             name=f"{client.get('firstName', '')} {client.get('lastName', '')}".strip(),
-            acuity_id=client.get("id"),
+            acuity_id=acuity_id,
         )
         db.add(new_client)
         db.commit()
+        db.close()
         return {
             "found": True,
             "client_id": new_client.id,
@@ -256,6 +265,7 @@ async def lookup_client(args: dict) -> dict:
             "is_returning": True,
         }
 
+    db.close()
     return {
         "found": False,
         "message": "Client not found in our system. This appears to be a new patient."
@@ -266,10 +276,6 @@ async def answer_question(args: dict) -> dict:
     """Answer common questions from knowledge base."""
     question = args.get("question", "").lower()
 
-    db = SessionLocal()
-
-    # Simple keyword matching for MVP
-    # In production, use vector search or more sophisticated KB
     if any(word in question for word in ["hour", "open", "close", "time"]):
         return {
             "answer": "The Practice is open Monday through Friday, 9am to 5pm. We're closed on weekends."
@@ -303,16 +309,14 @@ async def transfer_to_human(args: dict, call_id: str) -> dict:
     reason = args.get("reason", "")
     summary = args.get("summary", "")
 
-    _call_state[call_id] = _call_state.get(call_id, {})
-    _call_state[call_id]["outcome"] = "transferred"
-    _call_state[call_id]["transfer_reason"] = reason
+    await call_state.set(call_id, "outcome", "transferred")
+    await call_state.set(call_id, "transfer_reason", reason)
 
-    # If crisis/emergency, include special handling
     is_crisis = any(word in reason.lower() for word in ["crisis", "emergency", "suicide", "harm"])
 
     return {
         "transfer": True,
-        "phone_number": settings.human_transfer_number or "+15555555555",  # Fallback
+        "phone_number": settings.human_transfer_number or "+15555555555",
         "message": "Connecting you with a staff member now.",
         "is_crisis": is_crisis,
         "crisis_message": "If you're in immediate danger, please call 911 or 988 for the suicide and crisis lifeline." if is_crisis else None
@@ -340,18 +344,16 @@ async def take_message(args: dict, call_id: str) -> dict:
     )
     db.add(review_item)
 
-    _call_state[call_id] = _call_state.get(call_id, {})
-    _call_state[call_id]["outcome"] = "message"
+    await call_state.set(call_id, "outcome", "message")
 
     db.commit()
+    db.close()
 
     return {
         "success": True,
         "message": f"Thank you. I've taken your message and someone will get back to you within {24 if urgency == 'low' else 4 if urgency == 'medium' else 1} hours."
     }
 
-
-# Background task functions
 
 def log_booking(call_id: str, appointment_id: int, client_email: str, provider_name: str):
     """Log successful booking to database."""
@@ -364,6 +366,8 @@ def log_booking(call_id: str, appointment_id: int, client_email: str, provider_n
         db.commit()
     except Exception as e:
         logger.error(f"Failed to log booking: {e}")
+    finally:
+        db.close()
 
 
 def log_call_completed(payload: dict):
@@ -374,7 +378,6 @@ def log_call_completed(payload: dict):
         call_id = call.get("id")
         status = payload.get("status", "")
 
-        # Check if we already logged this call
         existing = db.query(CallLog).filter(CallLog.vapi_call_id == call_id).first()
         if existing:
             existing.ended_at = datetime.utcnow()
@@ -383,13 +386,12 @@ def log_call_completed(payload: dict):
             db.commit()
             return
 
-        # Create new call log
         call_log = CallLog(
             vapi_call_id=call_id,
             caller_phone=call.get("phoneNumber", {}).get("number"),
             started_at=datetime.fromisoformat(call.get("startedAt", "").replace("Z", "+00:00")) if call.get("startedAt") else None,
             ended_at=datetime.fromisoformat(call.get("endedAt", "").replace("Z", "+00:00")) if call.get("endedAt") else None,
-            outcome=_call_state.get(call_id, {}).get("outcome", "unknown"),
+            outcome=payload.get("outcome", "unknown"),
         )
         db.add(call_log)
         db.commit()
@@ -398,8 +400,6 @@ def log_call_completed(payload: dict):
     finally:
         db.close()
 
-
-# Admin routes (basic for MVP)
 
 @app.get("/admin/stats")
 def admin_stats():

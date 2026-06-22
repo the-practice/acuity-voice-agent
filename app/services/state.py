@@ -37,25 +37,22 @@ class CallState:
         """Get state for call_id."""
         if self._enabled and self._redis:
             try:
-                data = await self._redis.get(f"call:{call_id}")
-                if data:
-                    state = json.loads(data)
-                    return state.get(key) if key else state
+                if key:
+                    data = await self._redis.hget(f"call:{call_id}", key)
+                    return json.loads(data) if data is not None else None
+                h = await self._redis.hgetall(f"call:{call_id}")
+                return {k: json.loads(v) for k, v in h.items()}
             except Exception as e:
                 logger.error(f"Redis get error: {e}")
         return self._memory.get(call_id, {}).get(key) if key else self._memory.get(call_id, {})
 
     async def set(self, call_id: str, key: str, value: Any) -> None:
-        """Set state value for call_id."""
+        """Set state value for call_id. Uses HSET so concurrent function
+        calls for the same call don't clobber each other."""
         if self._enabled and self._redis:
             try:
-                existing = await self.get(call_id)
-                existing[key] = value
-                await self._redis.setex(
-                    f"call:{call_id}",
-                    timedelta(hours=24),
-                    json.dumps(existing),
-                )
+                await self._redis.hset(f"call:{call_id}", key, json.dumps(value))
+                await self._redis.expire(f"call:{call_id}", int(timedelta(hours=24).total_seconds()))
                 return
             except Exception as e:
                 logger.error(f"Redis set error: {e}")

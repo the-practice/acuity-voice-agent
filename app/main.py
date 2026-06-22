@@ -1,8 +1,7 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, Depends, Header
+from fastapi.concurrency import run_in_threadpool
 from datetime import datetime, date
-from typing import Any
 import logging
 
 from app.config import settings
@@ -36,12 +35,23 @@ def health():
 
 
 @app.post("/webhooks/vapi")
-async def vapi_webhook(request: Request, background_tasks: BackgroundTasks):
+async def vapi_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    x_vapi_secret: str | None = Header(default=None),
+):
     """Handle Vapi webhooks - function calls and events."""
-    payload = await request.json()
+    # ponytail: shared-secret check. Set the same value as Vapi's Server Secret;
+    # match the header name to your Vapi config if it isn't X-Vapi-Secret.
+    if not settings.vapi_auth_token or x_vapi_secret != settings.vapi_auth_token:
+        raise HTTPException(status_code=401, detail="unauthorized")
 
-    event_type = payload.get("type")
-    call_id = payload.get("call", {}).get("id")
+    payload = await request.json()
+    # Newer Vapi wraps events under "message"; tolerate both shapes.
+    msg = payload.get("message", payload)
+
+    event_type = msg.get("type")
+    call_id = (msg.get("call") or {}).get("id")
 
     if event_type == "assistant-request":
         return {
@@ -55,11 +65,11 @@ async def vapi_webhook(request: Request, background_tasks: BackgroundTasks):
         }
 
     elif event_type == "function-call":
-        func_call = VapiFunctionCall(**payload.get("functionCall", {}))
+        func_call = VapiFunctionCall(**(msg.get("functionCall") or {}))
         return await handle_function_call(func_call, call_id, background_tasks)
 
     elif event_type == "conversation-update":
-        background_tasks.add_task(log_call_completed, payload)
+        background_tasks.add_task(log_call_completed, msg)
         return {"status": "logged"}
 
     return {"status": "received"}
@@ -103,8 +113,8 @@ async def check_availability(args: dict) -> dict:
     date_str = args.get("date")
 
     try:
-        appt_date = date.fromisoformat(date_str.replace("-", ""))
-    except ValueError:
+        appt_date = date.fromisoformat(date_str)
+    except (ValueError, TypeError, AttributeError):
         return {"error": "Invalid date format. Use YYYY-MM-DD."}
 
     # Get calendars and appointment types (cached)
@@ -203,52 +213,29 @@ async def book_appointment(args: dict, call_id: str, background_tasks: Backgroun
     }
 
 
-async def lookup_client(args: dict) -> dict:
-    """Lookup a returning client in IntakeQ and Acuity."""
-    email = args.get("email")
-    phone = args.get("phone")
-    name = args.get("name")
-
-    if not email and not phone:
-        return {"error": "Email or phone required for lookup."}
-
+def _lookup_local_client(email: str | None, phone: str | None) -> dict | None:
+    """Sync DB read; run via threadpool to avoid blocking the event loop."""
     db = SessionLocal()
-
-    # Check local DB first
-    if email:
-        local_client = db.query(Client).filter(Client.email == email).first()
-    elif phone:
-        local_client = db.query(Client).filter(Client.phone == phone).first()
-    else:
-        local_client = None
-
-    if local_client:
+    try:
+        if email:
+            c = db.query(Client).filter(Client.email == email).first()
+        elif phone:
+            c = db.query(Client).filter(Client.phone == phone).first()
+        else:
+            c = None
+        return {"client_id": c.id, "name": c.name} if c else None
+    finally:
         db.close()
-        return {
-            "found": True,
-            "client_id": local_client.id,
-            "name": local_client.name,
-            "is_returning": True,
-        }
 
-    # Check Acuity
-    acuity_clients = await acuity.get_clients(email=email, phone=phone)
-    if acuity_clients:
-        client = acuity_clients[0]
+
+def _upsert_acuity_client(client: dict) -> dict:
+    """Sync DB upsert by acuity_id; returns local client info."""
+    db = SessionLocal()
+    try:
         acuity_id = client.get("id")
-
-        # Check if we already have this acuity_id to prevent dupes
         existing = db.query(Client).filter(Client.acuity_id == acuity_id).first()
         if existing:
-            db.close()
-            return {
-                "found": True,
-                "client_id": existing.id,
-                "name": existing.name,
-                "is_returning": True,
-            }
-
-        # New to us but exists in Acuity
+            return {"client_id": existing.id, "name": existing.name}
         new_client = Client(
             email=client.get("email"),
             phone=client.get("phone"),
@@ -257,15 +244,30 @@ async def lookup_client(args: dict) -> dict:
         )
         db.add(new_client)
         db.commit()
+        return {"client_id": new_client.id, "name": new_client.name}
+    finally:
         db.close()
-        return {
-            "found": True,
-            "client_id": new_client.id,
-            "name": new_client.name,
-            "is_returning": True,
-        }
 
-    db.close()
+
+async def lookup_client(args: dict) -> dict:
+    """Lookup a returning client in IntakeQ and Acuity."""
+    email = args.get("email")
+    phone = args.get("phone")
+
+    if not email and not phone:
+        return {"error": "Email or phone required for lookup."}
+
+    # Check local DB first
+    local = await run_in_threadpool(_lookup_local_client, email, phone)
+    if local:
+        return {"found": True, **local, "is_returning": True}
+
+    # Check Acuity
+    acuity_clients = await acuity.get_clients(email=email, phone=phone)
+    if acuity_clients:
+        result = await run_in_threadpool(_upsert_acuity_client, acuity_clients[0])
+        return {"found": True, **result, "is_returning": True}
+
     return {
         "found": False,
         "message": "Client not found in our system. This appears to be a new patient."
@@ -323,6 +325,24 @@ async def transfer_to_human(args: dict, call_id: str) -> dict:
     }
 
 
+def _save_review_message(caller_name: str, caller_phone: str, message: str, urgency: str, call_id: str) -> None:
+    db = SessionLocal()
+    try:
+        db.add(ReviewItem(
+            type="message",
+            severity=urgency,
+            context={
+                "caller_name": caller_name,
+                "caller_phone": caller_phone,
+                "message": message,
+                "call_id": call_id,
+            },
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+
 async def take_message(args: dict, call_id: str) -> dict:
     """Take a message and queue for follow-up."""
     caller_name = args.get("caller_name", "Unknown")
@@ -330,24 +350,8 @@ async def take_message(args: dict, call_id: str) -> dict:
     message = args.get("message", "")
     urgency = args.get("urgency", "medium")
 
-    db = SessionLocal()
-
-    review_item = ReviewItem(
-        type="message",
-        severity=urgency,
-        context={
-            "caller_name": caller_name,
-            "caller_phone": caller_phone,
-            "message": message,
-            "call_id": call_id,
-        },
-    )
-    db.add(review_item)
-
+    await run_in_threadpool(_save_review_message, caller_name, caller_phone, message, urgency, call_id)
     await call_state.set(call_id, "outcome", "message")
-
-    db.commit()
-    db.close()
 
     return {
         "success": True,
@@ -359,10 +363,14 @@ def log_booking(call_id: str, appointment_id: int, client_email: str, provider_n
     """Log successful booking to database."""
     db = SessionLocal()
     try:
+        # Booking happens mid-call, before the end-of-call row exists — upsert.
         call_log = db.query(CallLog).filter(CallLog.vapi_call_id == call_id).first()
-        if call_log:
-            call_log.outcome = "booked"
-            call_log.summary = f"Booked appointment {appointment_id} for {client_email} with {provider_name}"
+        if not call_log:
+            call_log = CallLog(vapi_call_id=call_id)
+            db.add(call_log)
+        call_log.outcome = "booked"
+        call_log.summary = f"Booked appointment {appointment_id} for {client_email} with {provider_name}"
+        call_log.contains_phi = True  # summary holds patient email
         db.commit()
     except Exception as e:
         logger.error(f"Failed to log booking: {e}")
@@ -401,7 +409,13 @@ def log_call_completed(payload: dict):
         db.close()
 
 
-@app.get("/admin/stats")
+def require_admin(authorization: str | None = Header(default=None)):
+    """Bearer-token gate for admin endpoints (they return PHI)."""
+    if not settings.admin_token or authorization != f"Bearer {settings.admin_token}":
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
+@app.get("/admin/stats", dependencies=[Depends(require_admin)])
 def admin_stats():
     """Basic call statistics for admin dashboard."""
     db = SessionLocal()
@@ -421,7 +435,7 @@ def admin_stats():
         db.close()
 
 
-@app.get("/admin/reviews")
+@app.get("/admin/reviews", dependencies=[Depends(require_admin)])
 def admin_reviews():
     """Get pending review items."""
     db = SessionLocal()

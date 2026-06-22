@@ -30,7 +30,7 @@ class CallLog(Base):
     summary = Column(Text)
     contains_phi = Column(Boolean, default=False)
     transcript_retention_days = Column(Integer, default=0)
-    vapi_call_id = Column(String(100))
+    vapi_call_id = Column(String(100), unique=True, index=True)  # de-facto key for lookups/upserts
 
 
 class SyncJob(Base):

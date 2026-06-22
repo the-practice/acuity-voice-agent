@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     # Human escalation
     human_transfer_number: str | None = None
 
+    # Admin dashboard auth (Bearer token)
+    admin_token: str | None = None
+
     # Retention
     transcript_retention_days: int = 0
 

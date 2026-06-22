@@ -1,14 +1,17 @@
 # Vapi webhook schemas and function definitions
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Literal, Any
 from datetime import datetime
 
 
 class VapiFunctionCall(BaseModel):
-    """Incoming function call from Vapi."""
+    """Incoming function call from Vapi. Vapi sends args under `parameters`;
+    call_id is read separately from the event's `call` object, not here."""
     name: str
-    arguments: dict
-    call_id: str
+    # accept both `parameters` (Vapi) and `arguments`
+    arguments: dict = Field(default_factory=dict, validation_alias="parameters")
+
+    model_config = {"populate_by_name": True}
 
 
 class VapiEvent(BaseModel):
@@ -151,7 +154,7 @@ IMPORTANT RULES:
 4. If unsure about something: don't guess. Transfer to human or take a message.
 5. Be warm, calm, and professional - this is a mental health practice
 
-SCHEDLING:
+SCHEDULING:
 - For new patients: collect name, contact, preferred date/time, insurance, presenting concern
 - For returning clients: verify identity first, then help with scheduling
 - Always confirm details before booking

@@ -1,8 +1,5 @@
 import httpx
 from datetime import date
-from typing import Any
-from functools import lru_cache
-from itertools import chain
 import logging
 
 from app.config import settings
@@ -23,7 +20,8 @@ class AcuityClient:
         self.api_key = settings.acuity_api_key
         self.user_id = settings.acuity_user_id
         self._client = None
-        self._cache_version = 0  # Increment to invalidate cache
+        self._cached_calendars = None
+        self._cached_appt_types = None
 
     async def client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -87,9 +85,9 @@ class AcuityClient:
         return r.json()
 
     async def _get_cached_appointment_types(self) -> list[dict]:
-        """Internal cached getter."""
-        cache_key = f"appt_types_{self._cache_version}"
-        if hasattr(self, "_cached_appt_types"):
+        """Internal cached getter. ponytail: process-lifetime cache; call
+        invalidate_cache() after editing types in Acuity, or restart."""
+        if self._cached_appt_types is not None:
             return self._cached_appt_types
         client = await self.client()
         r = await client.get("/appointment-types")
@@ -108,7 +106,7 @@ class AcuityClient:
 
     async def _get_cached_calendars(self) -> list[dict]:
         """Internal cached getter."""
-        if hasattr(self, "_cached_calendars"):
+        if self._cached_calendars is not None:
             return self._cached_calendars
         client = await self.client()
         r = await client.get("/calendars")
@@ -118,7 +116,6 @@ class AcuityClient:
 
     def invalidate_cache(self):
         """Invalidate cached calendars/appointment types."""
-        self._cache_version += 1
         self._cached_calendars = None
         self._cached_appt_types = None
 
